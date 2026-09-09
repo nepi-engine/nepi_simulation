@@ -1,0 +1,172 @@
+#!/bin/bash
+
+##
+## Copyright (c) 2024 Numurus <https://www.numurus.com>.
+##
+## This file is part of nepi setup tools (nepi_setup) repo
+## (see https://github.com/nepi-engine/nepi_setup)
+##
+## License: nepi setup tools are licensed under the "Numurus Software License",
+## which can be found at: <https://numurus.com/wp-content/uploads/Numurus-Software-License-Terms.pdf>
+##
+## Redistributions in source code must retain this top-level comment block.
+## Plagiarizing this software to sidestep the license obligations is illegal.
+##
+## Contact Information:
+## ====================
+## - mailto:nepi@numurus.com
+##
+
+# gazebo_setup's own copy of the handful of nepi_bash_utils functions its
+# scripts actually call (is_valid_internet, ask_yes_no, update_yaml_value).
+# The upstream nepi_setup repo's nepi_bash_utils is 5000+ lines covering
+# docker, hardware, and other concerns this repo has no use for -- trimmed
+# here rather than vendored whole so there is nothing to keep in sync that
+# gazebo_setup doesn't actually call. Named nepi_gazebo_bash_utils (not
+# nepi_bash_utils) so it's never mistaken for -- or silently shadowed by --
+# the real nepi_setup one on a machine that has both.
+#
+# update_yaml_value below is also simplified relative to upstream: the
+# original dispatches to a Python helper when NEPI_MODE=REMOTE (a device
+# driving another device's file over a transport). Everything in
+# gazebo_setup only ever edits a YAML file on the same machine the script
+# runs on, so that branch (and the helper script it calls) is dropped --
+# this always shells out to `yq` directly.
+#
+# nepistorage (and the NEPI_MODE/NEPI_USER/NEPI_IP/pingn it depends on) is
+# ported verbatim from upstream, REMOTE branch included: the Gazebo VM/host
+# is a separate machine from the NEPI device, so reaching the device's
+# storage share over the network is a real use case here, unlike
+# update_yaml_value's REMOTE path. NEPI_IP is upstream's own placeholder
+# default -- override it for the actual NEPI device on your network.
+
+if [[ ! -n $CONFIG_USER ]]; then
+    CONFIG_USER=$(id -un)
+    if [[ ${CONFIG_USER} == 'root' ]]; then
+        CONFIG_USER=$SUDO_USER
+    fi
+fi
+if [[ ! -n $CONFIG_USER ]]; then
+    CONFIG_USER=$(id -nu 1000)
+fi
+export CONFIG_USER=$CONFIG_USER
+
+export BASH_FOLDER=$(cd -P "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)
+
+if [[ ${NEPI_MODE} == 'SYSTEM' || ${NEPI_MODE} == 'HOST' || ${NEPI_MODE} == 'REMOTE' ]]; then
+  nepi_mode=$NEPI_MODE
+else
+  nepi_mode='SYSTEM'
+fi
+export NEPI_MODE=$nepi_mode
+
+export NEPI_USER=nepi
+export NEPI_IP=192.168.179.103
+
+
+function is_valid_internet(){
+    if ! ping -c 2 google.com; then
+        echo "No Internet Connection"
+        return 1
+    else
+        echo "Internet Connected"
+        return 0
+    fi
+}
+export -f is_valid_internet
+
+
+function ask_yes_no {
+    read -p "$1 ([y]es or [N]o): " choice
+    case "$(echo "$choice" | tr '[:upper:]' '[:lower:]')" in
+        y|yes) echo "yes" ;;
+        *) echo "no" ;;
+    esac
+}
+export -f ask_yes_no
+
+
+function pingn(){
+    ip="${NEPI_IP%%/*}"
+    if ! timeout 1 ping -c 1 -W 1 ${ip} > /dev/null 2>&1; then
+        echo "No NEPI Connection at ${ip}"
+        return 1
+    else
+        echo "NEPI Connected at ${ip}"
+    fi
+}
+export -f pingn
+
+
+function update_yaml_value(){
+    export UPDATE_YAML_KEY=$1
+    export UPDATE_YAML_VAL=$2
+    export UPDATE_YAML_FILE=$3
+
+    yq e -i '.'"$UPDATE_YAML_KEY"' = env(UPDATE_YAML_VAL)' $UPDATE_YAML_FILE
+
+    eval "export $UPDATE_YAML_KEY=\"$UPDATE_YAML_VAL\""
+}
+export -f update_yaml_value
+
+
+function nepistorage() {
+
+  shpassword=$1
+  shfolder=nepi_storage
+  if [[ ${NEPI_MODE} == 'REMOTE' ]]; then
+    sudo -v
+    if pingn; then
+
+      shdrive=/mnt/nepi_share_storage
+
+      #echo "Checking for mountpoint at: ${shdrive}"
+      sudo umount -l $shdrive >/dev/null
+      # timeout 1 mountpoint -q $shdrive
+      # if [[ $? -eq 0 ]]; then
+      #   echo "Unmounting mountpoint at: ${shdrive}"
+      #   timeout 1 sudo umount $shdrivelib
+      # fi
+
+      echo "Checking for mount folder at: ${shdrive}"
+      if [[ ! -d $shdrive ]]; then
+          echo "Creating mount folder: ${shdrive}"
+          sudo mkdir $shdrive
+      fi
+
+
+      echo "Setting mount folder permissions: ${shdrive}"
+      sudo chown ${CONFIG_USER}:${CONFIG_USER} $shdrive
+      echo "Mounting shared drive at: //${NEPI_IP}/${shfolder} to ${shdrive}"
+      if [[ -n $shpassword ]]; then
+        sudo mount.cifs //${NEPI_IP}/${shfolder} $shdrive -o user=$NEPI_USER,password=$shpassword,uid=$(id -u),gid=$(id -g)
+      else
+        sudo mount.cifs //${NEPI_IP}/${shfolder} $shdrive -o user=$NEPI_USER,uid=$(id -u),gid=$(id -g)
+      fi
+
+      if timeout 1 mountpoint -q $shdrive; then
+        cd $shdrive
+        echo $shdrive
+        return 0
+      else
+        echo "Failed to mount and connect nepi shared folder: ${shdrive}"
+        return 1
+      fi
+    else
+        return 1
+    fi
+  else
+    shdrive=/mnt/${shfolder}
+    if [[ -d $shdrive ]]; then
+      cd $shdrive
+      echo $shdrive
+      return 0
+    else
+      echo "Failed to mount and connect nepi shared folder: ${shdrive}"
+
+      return 1
+    fi
+  fi
+}
+
+export -f nepistorage
