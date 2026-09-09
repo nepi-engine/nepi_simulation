@@ -6,6 +6,6 @@ chassis_length_m: 0.4
 chassis_width_m: 0.3
 chassis_height_m: 0.1
 weight_kg: 5
-camera_horizontal_fov_deg: '40'
+camera_horizontal_fov_deg: '100'
 wheel_independence_enabled: 0
 

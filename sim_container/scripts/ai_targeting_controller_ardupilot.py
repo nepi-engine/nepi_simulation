@@ -134,6 +134,24 @@ BRIDGE_PORT = 9027
 # of this instance quietly running forever with no target to report.
 TEARDOWN_PORT = 9029
 
+# Start trigger -- added 2026-09-09, requested live: "the chair object seems
+# to be around even though the follow object script isnt on. it should only
+# spawn in if that gets selected on." This node launches unconditionally
+# alongside gazebo_quadcopter (see simulator_launch_targets.yaml), so before
+# this change the chair existed for the entire lifetime of the quadcopter
+# sim regardless of whether drone_follow_object_mission_script.py -- or any
+# other follow-mission script -- was ever started; only a script's own
+# cleanup_actions() teardown (TEARDOWN_PORT above) ever made it disappear,
+# so a session where the script never ran at all still showed the chair the
+# whole time. Symmetric with TEARDOWN_PORT (9030 is the next free slot --
+# 9021-9029 are all already assigned in this directory's other scripts, and
+# 9031-9033 are the device-side relay ports mavlink_relay_vm.py/
+# camera_bridge_relay_vm.py/ai_targeting_relay_vm.py already claim). Spawning
+# is now deferred until exactly one client
+# (drone_follow_object_mission_script.py's own __init__) connects here -- see
+# startTriggerServerLoop.
+START_TRIGGER_PORT = 9030
+
 
 class AiTargetingControllerArdupilot:
 
@@ -153,26 +171,14 @@ class AiTargetingControllerArdupilot:
     self.client_lock = threading.Lock()
     self.client_conn = None
 
-    # Backgrounded with retries, not a single blocking attempt -- confirmed
-    # live (2026-09-08) as a real, reproducible startup race: this node can
-    # (and, in the exact launch_command ordering used by the sim_connector
-    # app, reliably does) start running before gzserver's own
-    # /gazebo/spawn_sdf_model service plugin has finished initializing,
-    # even though /gazebo/model_states (what launch_command's own gz_wait
-    # loop checks for) is already up by then. The one-shot version of this
-    # call just logged "spawn service call failed: timeout exceeded" and
-    # gave up permanently -- sim_target_chair never existed for the rest of
-    # this node's life, silently breaking the entire follow-mission demo
-    # with no further symptom anywhere else (the circling-position logic
-    # and the bridge server both still ran normally, "chair" just never
-    # visually or physically existed in the world). Same "keep retrying in
-    # the background instead of giving up permanently" fix already proven
-    # for the identical class of startup race in this app (see
-    # sim_ai_targeting_bridge_script.py's own trigger_remote_sim_launch/
-    # imageRelayThread comments).
-    self.spawn_thread = threading.Thread(target = self.spawnTargetModelRetryLoop)
-    self.spawn_thread.daemon = True
-    self.spawn_thread.start()
+    # Spawning itself is now deferred to startTriggerServerLoop (see
+    # START_TRIGGER_PORT's own comment) -- this used to start
+    # spawnTargetModelRetryLoop unconditionally right here, which is what
+    # kept the chair alive for the entire quadcopter sim session regardless
+    # of whether a follow-mission script ever ran.
+    self.start_trigger_thread = threading.Thread(target = self.startTriggerServerLoop)
+    self.start_trigger_thread.daemon = True
+    self.start_trigger_thread.start()
 
     self.state_pub = rospy.Publisher(MODEL_STATE_TOPIC, ModelState, queue_size = 1)
     self.model_states_sub = rospy.Subscriber(MODEL_STATES_TOPIC, ModelStates, self.modelStatesCb)
@@ -192,6 +198,8 @@ class AiTargetingControllerArdupilot:
                   str(CIRCLE_CENTER_X) + "," + str(CIRCLE_CENTER_Y) + "), radius " +
                   str(CIRCLE_RADIUS_M) + "m, period " + str(CIRCLE_PERIOD_SEC) + "s")
     rospy.loginfo(PKG_NAME + ": Targeting bridge server on 127.0.0.1:" + str(BRIDGE_PORT))
+    rospy.loginfo(PKG_NAME + ": Start-trigger listener on 127.0.0.1:" + str(START_TRIGGER_PORT) +
+                  " (target not spawned until triggered)")
     rospy.loginfo(PKG_NAME + ": Teardown listener on 127.0.0.1:" + str(TEARDOWN_PORT))
 
   def run(self):
@@ -237,6 +245,49 @@ class AiTargetingControllerArdupilot:
     except Exception as e:
       rospy.logwarn(PKG_NAME + ": Target model spawn service call failed, will retry: " + str(e))
       return False
+
+  def startTriggerServerLoop(self):
+    """Single-shot: waits for exactly one start trigger (sent by
+    drone_follow_object_mission_script.py's own __init__, or any other
+    follow-mission script wired to SIM_START_PORT the same way) before the
+    target model is spawned at all -- see START_TRIGGER_PORT's own comment.
+    Mirrors teardownServerLoop's accept-once shape, but does NOT shut this
+    node down afterward: receiving a start trigger is the BEGINNING of this
+    node's useful life, not the end. Spawning stays backgrounded with
+    retries (spawnTargetModelRetryLoop, unchanged) rather than a single
+    blocking attempt, for the same gzserver-not-ready-yet race
+    spawnTargetModelRetryLoop's own comment already documents."""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.settimeout(None)
+    try:
+      srv.bind(('0.0.0.0', START_TRIGGER_PORT))  # 0.0.0.0: direct-LAN reachable, see sim_bridge_node.py's own bind comment
+      srv.listen(1)
+    except Exception as e:
+      rospy.logerr(PKG_NAME + ": Could not bind start-trigger listener on 127.0.0.1:" +
+                   str(START_TRIGGER_PORT) + ": " + str(e))
+      return
+    try:
+      conn, _ = srv.accept()
+    except Exception:
+      return
+    rospy.loginfo(PKG_NAME + ": Start triggered -- spawning target")
+    try:
+      conn.sendall(b'OK\n')
+    except Exception as e:
+      rospy.logwarn(PKG_NAME + ": Start-trigger response failed: " + str(e))
+    finally:
+      try:
+        conn.close()
+      except Exception:
+        pass
+      try:
+        srv.close()
+      except Exception:
+        pass
+    self.spawn_thread = threading.Thread(target = self.spawnTargetModelRetryLoop)
+    self.spawn_thread.daemon = True
+    self.spawn_thread.start()
 
   def despawnTargetModel(self):
     try:

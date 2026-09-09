@@ -80,6 +80,8 @@
 import base64
 import json
 import math
+import os
+import re
 import socket
 import threading
 import time
@@ -90,6 +92,8 @@ import rospy
 
 from sensor_msgs.msg import Image
 from gazebo_msgs.msg import ModelState, ModelStates
+from gazebo_msgs.srv import SpawnModel, DeleteModel, GetWorldProperties
+from geometry_msgs.msg import Pose
 from cv_bridge import CvBridge
 
 import environment_models
@@ -160,13 +164,19 @@ BRIDGE_PORT = 9026
 # confusing for exactly the same reason the rover's own camera offset was
 # before its matching fix.
 #
-# Robot view (nose cam): directly on top of the body, centered (x=0, y=0) --
+# Robot view (nose cam): directly on top of the body, centered (y=0) --
 # was forward-and-below (a nose/belly mount); moved per the same live
 # request above. z=0.15 clears a typical small-quad body's own top plate/
 # GPS mast without the render clipping into the airframe mesh.
-FACTORY_OFFSET_X = 0.0
+# x/z nudged (2026-09-09, requested live: "make the default position 0.05
+# forward for the x and -0.05 down for the z from where it is right now --
+# this just fits it a bit more accurate to a good slot") -- 0.05 forward
+# puts the lens a bit past the top-plate/GPS-mast clearance z=0.15 was
+# originally sized for, so z is lowered by the same 0.05 to keep that
+# clearance margin roughly what it was.
+FACTORY_OFFSET_X = 0.05
 FACTORY_OFFSET_Y = 0.0
-FACTORY_OFFSET_Z = 0.15
+FACTORY_OFFSET_Z = 0.10
 DEFAULT_OFFSET_X = 0.0
 DEFAULT_OFFSET_Y = 0.0
 DEFAULT_OFFSET_Z = 0.0
@@ -181,6 +191,81 @@ FACTORY_SCENE_OFFSET_Z = 1.0
 DEFAULT_SCENE_OFFSET_X = 0.0
 DEFAULT_SCENE_OFFSET_Y = 0.0
 DEFAULT_SCENE_OFFSET_Z = 0.0
+
+# Shared horizontal FOV for both camera rigs, live-adjustable the same way
+# rbx_sim_node.py's own camera_fov_deg is for the rover (see that Setting's
+# own comment in rbx_sim_node.py) -- requested live (2026-09-09): "changing
+# the fov values still doesnt seem to do anything for the drone." Unlike
+# the offset Settings above (applied every tick via /gazebo/set_model_state,
+# no respawn needed), FOV is baked into each rig's own SDF <horizontal_fov>
+# at spawn time, so changing it needs a real respawn -- the same mechanism
+# sim_bridge_node.py's respawnRoverWithCameraOffsets already proved for the
+# rover, adapted here for these two simpler (no wheels/joints, one camera
+# sensor each) standalone models. Matches models/camera_rig/model.sdf and
+# models/camera_rig_chase/model.sdf's own hard-coded 1.3962634 rad (80 deg).
+FACTORY_CAMERA_FOV_DEG = 80.0
+
+# camera_rig and camera_rig_chase are now BOTH spawned here at startup
+# (see spawnCameraRigsRetryLoop) instead of via the world file's own
+# static <include> tags -- both existed there already (camera_rig_chase
+# was added 2026-09-08, in a fix this file's git-tracked copy just hadn't
+# caught up with, so an earlier version of this comment WRONGLY claimed it
+# never existed at all -- confirmed live 2026-09-09 that the actually-
+# deployed world file already included it correctly, both cameras already
+# worked, and the real bug this whole change addresses is different: FOV
+# needs a respawn, and a name that originates from a world-file <include>
+# hits a real Gazebo caching quirk on its first respawn -- the exact one
+# sim_bridge_node.py's own ROVER_MODEL_NAME_CUSTOM works around for the
+# rover. Confirmed live: leaving both <include> tags in place while also
+# respawning under those same names left both image topics silently dead
+# after the first FOV change. Cleanest fix is for Python to own spawning
+# both from the start (both <include> tags removed from the world file),
+# so neither name is ever <include>-derived in the first place -- matches
+# the already-proven "spawn on demand, retry if gzserver's spawn service
+# isn't up yet" pattern ai_targeting_controller_ardupilot.py's own chair
+# uses, and means every respawn after the first can safely reuse the same
+# name, same as the rover's own custom name does.
+CAMERA_RIG_SDF_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    '..', 'models', 'camera_rig', 'model.sdf')
+CAMERA_RIG_CHASE_SDF_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                          '..', 'models', 'camera_rig_chase', 'model.sdf')
+SPAWN_MODEL_SERVICE = '/gazebo/spawn_sdf_model'
+DELETE_MODEL_SERVICE = '/gazebo/delete_model'
+GET_WORLD_PROPERTIES_SERVICE = '/gazebo/get_world_properties'
+GAZEBO_SERVICE_WAIT_SEC = 5.0
+# See spawnCameraRigsRetryLoop's own comment for why this is a loop, not a
+# single attempt -- same gzserver-spawn-service-not-ready-yet race
+# ai_targeting_controller_ardupilot.py's own spawnTargetModelRetryLoop
+# documents.
+SPAWN_RETRY_INTERVAL_SEC = 3.0
+DELETE_CONFIRM_TIMEOUT_SEC = 5.0
+DELETE_CONFIRM_POLL_INTERVAL_SEC = 0.1
+# Same race as sim_bridge_node.py's own _waitForOldCameraServicesGone:
+# get_world_properties dropping a deleted model's name fires as soon as
+# Gazebo's own bookkeeping removes it, which is EARLIER than the model's
+# libgazebo_ros_openni_kinect.so plugin instance actually deregistering its
+# own ROS services -- spawning the replacement before that finishes hits
+# "Tried to advertise a service that is already advertised" and silently
+# kills the new instance's own image topics.
+CAMERA_SERVICE_TEARDOWN_TIMEOUT_SEC = 2.0
+OLD_CAMERA_SERVICE_NAMES = ('/camera_rig/camera/set_parameters',
+                            '/camera_rig_chase/camera/set_parameters')
+# Same coalescing-burst reasoning as sim_bridge_node.py's own
+# CAMERA_RESPAWN_DEBOUNCE_SEC -- an operator's Enter-key FOV edit is one
+# update, but guards against any future caller that might send several in
+# quick succession triggering overlapping delete+spawn cycles.
+CAMERA_RESPAWN_DEBOUNCE_SEC = 0.6
+
+# Matches CAMERA_FOV_RE's shape in sim_bridge_node.py -- one pattern per
+# rig, keyed by the model name whose SDF it edits.
+CAMERA_FOV_RE = {
+  'camera_rig': re.compile(
+      r'(<camera name="camera_rig_camera">\s*<horizontal_fov>)'
+      r'[-0-9.eE]+(</horizontal_fov>)'),
+  'camera_rig_chase': re.compile(
+      r'(<camera name="camera_rig_chase_camera">\s*<horizontal_fov>)'
+      r'[-0-9.eE]+(</horizontal_fov>)'),
+}
 
 
 class CameraRigControllerArdupilot:
@@ -205,6 +290,26 @@ class CameraRigControllerArdupilot:
     self.scene_offset_x = DEFAULT_SCENE_OFFSET_X
     self.scene_offset_y = DEFAULT_SCENE_OFFSET_Y
     self.scene_offset_z = DEFAULT_SCENE_OFFSET_Z
+    self.fov_deg = FACTORY_CAMERA_FOV_DEG
+    # FOV actually baked into the currently-spawned rigs -- distinct from
+    # self.fov_deg (the last COMMANDED value) so a burst of identical
+    # updates during the debounce window doesn't trigger a redundant
+    # respawn once one is already in flight for that same value. Same
+    # applied_camera_offsets pattern sim_bridge_node.py uses.
+    self.applied_fov_deg = FACTORY_CAMERA_FOV_DEG
+
+    # Respawn machinery for FOV changes only -- offsets above are applied
+    # live every tick via /gazebo/set_model_state (driveRig), no respawn
+    # needed, but FOV is baked into each rig's own SDF at spawn time. Same
+    # debounce-then-respawn shape as sim_bridge_node.py's own
+    # scheduleCameraRespawn/respawnPendingCameraOffsets/
+    # camera_respawn_inflight_lock.
+    self.camera_respawn_lock = threading.Lock()
+    self.pending_fov_deg = None
+    self.camera_respawn_timer = None
+    self.camera_respawn_inflight_lock = threading.Lock()
+    self.camera_rig_sdf_template = self._readSdfTemplate(CAMERA_RIG_SDF_PATH)
+    self.camera_rig_chase_sdf_template = self._readSdfTemplate(CAMERA_RIG_CHASE_SDF_PATH)
 
     self.image_lock = threading.Lock()
     self.latest_robot_view_img = None
@@ -224,6 +329,17 @@ class CameraRigControllerArdupilot:
     # 2026-09-08, requested live: "changing the environment also doesnt do
     # anything" for the quadcopter.
     self.env_spawner = environment_models.EnvironmentModelSpawner(log_prefix = PKG_NAME)
+
+    # Spawns camera_rig and camera_rig_chase (backgrounded with retries --
+    # see SPAWN_RETRY_INTERVAL_SEC's own comment for the gzserver-not-ready
+    # race this guards against, identical in kind to
+    # ai_targeting_controller_ardupilot.py's own chair spawn). Neither model
+    # comes from a world-file <include> any more -- see FACTORY_CAMERA_FOV_DEG's
+    # own comment for why (a Gazebo naming-cache quirk on FOV respawn, not a
+    # missing model -- both cameras already worked before this change).
+    self.spawn_thread = threading.Thread(target = self.spawnCameraRigsRetryLoop)
+    self.spawn_thread.daemon = True
+    self.spawn_thread.start()
 
     self.state_pub = rospy.Publisher(MODEL_STATE_TOPIC, ModelState, queue_size = 1)
 
@@ -468,6 +584,7 @@ class CameraRigControllerArdupilot:
     self.sendLineToClient(line)
 
   def applyCameraSettings(self, cmd):
+    respawn_fov = None
     with self.settings_lock:
       self.offset_x = float(cmd.get('offset_x', DEFAULT_OFFSET_X))
       self.offset_y = float(cmd.get('offset_y', DEFAULT_OFFSET_Y))
@@ -475,6 +592,189 @@ class CameraRigControllerArdupilot:
       self.scene_offset_x = float(cmd.get('scene_offset_x', DEFAULT_SCENE_OFFSET_X))
       self.scene_offset_y = float(cmd.get('scene_offset_y', DEFAULT_SCENE_OFFSET_Y))
       self.scene_offset_z = float(cmd.get('scene_offset_z', DEFAULT_SCENE_OFFSET_Z))
+      new_fov = float(cmd.get('fov_deg', self.fov_deg))
+      if new_fov != self.fov_deg:
+        self.fov_deg = new_fov
+        respawn_fov = new_fov
+    # Outside settings_lock -- scheduleFovRespawn takes its own lock, and
+    # nothing here needs to stay atomic with the settings_dict update above.
+    if respawn_fov is not None:
+      self.scheduleFovRespawn(respawn_fov)
+
+  # ---- Camera rig spawn/respawn (FOV) ----------------------------------
+
+  def _readSdfTemplate(self, path):
+    try:
+      with open(path, 'r') as f:
+        return f.read()
+    except Exception as e:
+      rospy.logerr(PKG_NAME + ": Failed to read SDF at " + path + ": " + str(e))
+      return None
+
+  def spawnCameraRigsRetryLoop(self):
+    while not rospy.is_shutdown():
+      if self._trySpawnBothCameraRigs():
+        return
+      time.sleep(SPAWN_RETRY_INTERVAL_SEC)
+
+  def _trySpawnBothCameraRigs(self):
+    """Returns True once both rigs are confirmed spawned (or already
+    present), False if this attempt should be retried."""
+    if self.camera_rig_sdf_template is None or self.camera_rig_chase_sdf_template is None:
+      return False
+    ok1 = self._trySpawnOneCameraRig('camera_rig', self.camera_rig_sdf_template,
+                                     CAMERA_FOV_RE['camera_rig'])
+    ok2 = self._trySpawnOneCameraRig('camera_rig_chase', self.camera_rig_chase_sdf_template,
+                                     CAMERA_FOV_RE['camera_rig_chase'])
+    return ok1 and ok2
+
+  def _trySpawnOneCameraRig(self, name, sdf_template, fov_re):
+    fov_rad = math.radians(FACTORY_CAMERA_FOV_DEG)
+    sdf, n = fov_re.subn(lambda m: m.group(1) + ("%.7f" % fov_rad) + m.group(2), sdf_template)
+    if n != 1:
+      rospy.logerr(PKG_NAME + ": FOV substitution for " + name + " matched " +
+                   str(n) + "/1, refusing to spawn an unverified model")
+      return False
+    initial_pose = Pose()
+    initial_pose.position.z = 1.0
+    initial_pose.orientation.w = 1.0
+    try:
+      rospy.wait_for_service(SPAWN_MODEL_SERVICE, timeout = GAZEBO_SERVICE_WAIT_SEC)
+      spawn = rospy.ServiceProxy(SPAWN_MODEL_SERVICE, SpawnModel)
+      resp = spawn(name, sdf, '', initial_pose, 'world')
+      if resp.success:
+        rospy.loginfo(PKG_NAME + ": " + name + " spawned")
+        return True
+      if 'already exist' in resp.status_message.lower():
+        # Already-spawned from a prior run of this node is the common case
+        # (Gazebo keeps running across node restarts) -- not fatal, the
+        # existing model is reused as-is (at whatever FOV it already has;
+        # a live FOV change still respawns it, same as any other case).
+        rospy.loginfo(PKG_NAME + ": " + name + " already exists, reusing: " +
+                      resp.status_message)
+        return True
+      rospy.logwarn(PKG_NAME + ": " + name + " spawn failed, will retry: " + resp.status_message)
+      return False
+    except Exception as e:
+      rospy.logwarn(PKG_NAME + ": " + name + " spawn service call failed, will retry: " + str(e))
+      return False
+
+  def scheduleFovRespawn(self, fov_deg):
+    # Debounced the same way sim_bridge_node.py's own scheduleCameraRespawn
+    # is: a burst of near-simultaneous updates (unlikely for a single Enter-
+    # key FOV box, but cheap insurance against any future caller that sends
+    # several settings in quick succession) replaces the pending value and
+    # restarts the timer, so only the LAST value in a burst actually
+    # respawns, once.
+    with self.camera_respawn_lock:
+      self.pending_fov_deg = fov_deg
+      if self.camera_respawn_timer is not None:
+        self.camera_respawn_timer.cancel()
+      self.camera_respawn_timer = threading.Timer(
+          CAMERA_RESPAWN_DEBOUNCE_SEC, self.respawnPendingFov)
+      self.camera_respawn_timer.daemon = True
+      self.camera_respawn_timer.start()
+
+  def respawnPendingFov(self):
+    with self.camera_respawn_lock:
+      fov_deg = self.pending_fov_deg
+      self.camera_respawn_timer = None
+    if fov_deg is not None and fov_deg != self.applied_fov_deg:
+      self.respawnCameraRigsWithFov(fov_deg)
+
+  def respawnCameraRigsWithFov(self, fov_deg):
+    # Thin wrapper: see sim_bridge_node.py's own
+    # camera_respawn_inflight_lock comment for why this needs to be a
+    # genuine mutex around the whole respawn, not just the debounce that
+    # decides whether to call this at all.
+    with self.camera_respawn_inflight_lock:
+      self._respawnCameraRigsWithFovLocked(fov_deg)
+
+  def _respawnCameraRigsWithFovLocked(self, fov_deg):
+    if fov_deg == self.applied_fov_deg:
+      # Re-checked here for the same reason sim_bridge_node.py's own
+      # _respawnRoverWithCameraOffsetsLocked does: a call queued up waiting
+      # on camera_respawn_inflight_lock can go stale while it waits.
+      return
+    if self.camera_rig_sdf_template is None or self.camera_rig_chase_sdf_template is None:
+      rospy.logwarn(PKG_NAME + ": No camera rig SDF loaded, cannot apply FOV")
+      return
+
+    fov_rad = math.radians(fov_deg)
+    rig_sdf, n1 = CAMERA_FOV_RE['camera_rig'].subn(
+        lambda m: m.group(1) + ("%.7f" % fov_rad) + m.group(2), self.camera_rig_sdf_template)
+    chase_sdf, n2 = CAMERA_FOV_RE['camera_rig_chase'].subn(
+        lambda m: m.group(1) + ("%.7f" % fov_rad) + m.group(2), self.camera_rig_chase_sdf_template)
+    if n1 != 1 or n2 != 1:
+      # A structural change to either model.sdf (renamed sensor, reordered
+      # tags) could make one of these regexes stop matching -- fail loudly
+      # rather than silently respawning with the OLD/default FOV, which
+      # would look exactly like "the setting doesn't do anything".
+      rospy.logerr(PKG_NAME + ": FOV substitution matched " + str(n1) +
+                   "/1 camera_rig, " + str(n2) + "/1 camera_rig_chase -- "
+                   "refusing to respawn with an unverified model")
+      return
+
+    initial_pose = Pose()
+    initial_pose.position.z = 1.0
+    initial_pose.orientation.w = 1.0
+    try:
+      self._deleteModelConfirmed('camera_rig')
+      self._deleteModelConfirmed('camera_rig_chase')
+      # Same race as sim_bridge_node.py's own respawn -- the plugins'
+      # ROS services can outlive get_world_properties no longer listing the
+      # model.
+      self._waitForOldCameraServicesGone()
+      rospy.wait_for_service(SPAWN_MODEL_SERVICE, timeout = GAZEBO_SERVICE_WAIT_SEC)
+      spawn = rospy.ServiceProxy(SPAWN_MODEL_SERVICE, SpawnModel)
+      resp1 = spawn('camera_rig', rig_sdf, '', initial_pose, 'world')
+      resp2 = spawn('camera_rig_chase', chase_sdf, '', initial_pose, 'world')
+      if not resp1.success or not resp2.success:
+        rospy.logerr(PKG_NAME + ": Respawn with new FOV failed: " +
+                     resp1.status_message + " / " + resp2.status_message)
+        return
+    except Exception as e:
+      rospy.logerr(PKG_NAME + ": Respawn with new FOV failed: " + str(e))
+      return
+
+    self.applied_fov_deg = fov_deg
+    rospy.loginfo(PKG_NAME + ": Applied camera FOV=%.1fdeg (respawned camera_rig/camera_rig_chase)" %
+                  fov_deg)
+
+  def _deleteModelConfirmed(self, name):
+    # Polls get_world_properties until name is actually gone from the model
+    # list instead of guessing a fixed delay -- DeleteModel returning does
+    # not guarantee Gazebo's own (asynchronous) deletion has finished yet.
+    # Same pattern as sim_bridge_node.py's own respawnRoverWithCameraOffsets.
+    rospy.wait_for_service(DELETE_MODEL_SERVICE, timeout = GAZEBO_SERVICE_WAIT_SEC)
+    rospy.ServiceProxy(DELETE_MODEL_SERVICE, DeleteModel)(name)
+    rospy.wait_for_service(GET_WORLD_PROPERTIES_SERVICE, timeout = GAZEBO_SERVICE_WAIT_SEC)
+    get_world_props = rospy.ServiceProxy(GET_WORLD_PROPERTIES_SERVICE, GetWorldProperties)
+    deadline = time.time() + DELETE_CONFIRM_TIMEOUT_SEC
+    while time.time() < deadline:
+      if name not in get_world_props().model_names:
+        return
+      time.sleep(DELETE_CONFIRM_POLL_INTERVAL_SEC)
+    rospy.logwarn(PKG_NAME + ": " + name + " still present " +
+                  str(DELETE_CONFIRM_TIMEOUT_SEC) + "s after DeleteModel -- proceeding anyway")
+
+  def _waitForOldCameraServicesGone(self):
+    # See OLD_CAMERA_SERVICE_NAMES's own comment for the race this guards
+    # against. Best-effort: proceeds after CAMERA_SERVICE_TEARDOWN_TIMEOUT_SEC
+    # even if a service is still listed -- spawning anyway is still better
+    # than never spawning at all, and this is the rare case, not the common
+    # one.
+    master = rospy.get_master()
+    deadline = time.time() + CAMERA_SERVICE_TEARDOWN_TIMEOUT_SEC
+    while time.time() < deadline:
+      try:
+        _, _, services = master.getSystemState()[2]
+        registered = {name for name, _nodes in services}
+      except Exception:
+        break
+      if not any(name in registered for name in OLD_CAMERA_SERVICE_NAMES):
+        return
+      time.sleep(DELETE_CONFIRM_POLL_INTERVAL_SEC)
 
   def sendLineToClient(self, line_dict):
     with self.client_lock:
