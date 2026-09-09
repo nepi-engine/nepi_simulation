@@ -1,0 +1,11 @@
+wheel_radius_m: 0.1
+wheel_width_m: 0.05
+track_width_m: 0.34
+wheelbase_m: 0.3
+chassis_length_m: 0.4
+chassis_width_m: 0.3
+chassis_height_m: 0.1
+weight_kg: 5
+camera_horizontal_fov_deg: '40'
+wheel_independence_enabled: 0
+
