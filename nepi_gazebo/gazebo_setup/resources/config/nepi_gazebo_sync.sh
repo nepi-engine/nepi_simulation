@@ -84,6 +84,15 @@ SOURCE_FILE=${SOURCE_PATH}/${CONFIG_FILENAME}
 UPDATE_FILE=${UPDATE_PATH}/${CONFIG_FILENAME}
 
 echo "Merging ${CONFIG_FILENAME} keys from ${UPDATE_PATH} into ${SOURCE_PATH}"
+# Create the storage-side folder first, the same way the ENVIRONMENT and
+# SYSTEM blocks below do. Without this, the very first run on a device that
+# has no databases/sims/gazebo/config yet fails at the cp ("No such file or
+# directory") -- and since the config file is what nepi_gazebo_start.sh and
+# nepi_gazebo.sh both read, that first run never gets off the ground.
+# mkdir -p on GAZEBO_SIM_FOLDER alone (above) does not cover this subfolder.
+if [[ ! -d $SOURCE_PATH ]]; then
+    sudo mkdir -p $SOURCE_PATH
+fi
 if [[ ! -f $SOURCE_FILE ]]; then
     sudo cp $UPDATE_FILE $SOURCE_FILE
 fi

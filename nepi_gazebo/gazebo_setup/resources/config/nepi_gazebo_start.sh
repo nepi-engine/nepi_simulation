@@ -103,12 +103,36 @@ fi
 # differently (this one direct via nohup, the service via its own poll
 # loop).
 
-# The one *.world file staged in ENVIRONMENT, picked up by name rather
-# than hardcoded to a specific world.
-WORLD_FILE=$(ls ${GAZEBO_ENVIRONMENT_FOLDER}/*.world 2>/dev/null | head -n 1)
+# GAZEBO_CURRENT_ENVIRONMENT names the world to launch; it is the same
+# selection the service honours, read straight from the config so both agree
+# on which world is "current". Only when it is unset (or names something that
+# is no longer staged) does this fall back to the first .world in the folder
+# -- which is alphabetical, and therefore a guess. The fallback is recorded
+# below so the guess happens at most once.
+CURRENT_ENVIRONMENT=$(yq e '.GAZEBO_CURRENT_ENVIRONMENT // ""' "$GAZEBO_CONFIG_FILE" 2>/dev/null)
+
+WORLD_FILE=""
+if [[ -n "$CURRENT_ENVIRONMENT" ]]; then
+    if [[ -f "${GAZEBO_ENVIRONMENT_FOLDER}/${CURRENT_ENVIRONMENT}" ]]; then
+        WORLD_FILE=${GAZEBO_ENVIRONMENT_FOLDER}/${CURRENT_ENVIRONMENT}
+    else
+        echo "Selected environment '${CURRENT_ENVIRONMENT}' is not staged in ${GAZEBO_ENVIRONMENT_FOLDER} -- falling back"
+    fi
+fi
+
+if [[ -z "$WORLD_FILE" ]]; then
+    WORLD_FILE=$(ls ${GAZEBO_ENVIRONMENT_FOLDER}/*.world 2>/dev/null | head -n 1)
+fi
+
 if [[ -z "$WORLD_FILE" ]]; then
     echo "No .world file found in ${GAZEBO_ENVIRONMENT_FOLDER} -- stage one before running this script"
     exit 1
+fi
+
+# Record what was actually launched, so the config always reflects reality
+# and the fallback above is not re-guessed on the next start.
+if [[ "$CURRENT_ENVIRONMENT" != "$(basename "$WORLD_FILE")" ]]; then
+    update_yaml_value GAZEBO_CURRENT_ENVIRONMENT "$(basename "$WORLD_FILE")" "$GAZEBO_CONFIG_FILE"
 fi
 
 export GAZEBO_MODEL_PATH=${GAZEBO_MODEL_PATH}:${GAZEBO_SYSTEM_FOLDER}
@@ -134,8 +158,12 @@ else
     update_yaml_value GAZEBO_STATE "running" "$GAZEBO_CONFIG_FILE"
     update_yaml_value GAZEBO_START 1 "$GAZEBO_CONFIG_FILE"
     update_yaml_value GAZEBO_STOP 0 "$GAZEBO_CONFIG_FILE"
-    update_yaml_value GAZEBO_LAST_ERROR "" "$GAZEBO_CONFIG_FILE"
-    update_yaml_value GAZEBO_LAST_UPDATED "$(date +%s)" "$GAZEBO_CONFIG_FILE"
+    # Cleared directly rather than via update_yaml_value -- that function's
+    # yq env() call errors on an empty value and leaves the field untouched,
+    # which is the same quirk nepi_gazebo.sh works around in
+    # clear_gazebo_last_error(). Going through it here would leave a stale
+    # error from a previous failed run sitting in a now-successful start.
+    yq e -i '.GAZEBO_LAST_ERROR = ""' "$GAZEBO_CONFIG_FILE"
 fi
 
 

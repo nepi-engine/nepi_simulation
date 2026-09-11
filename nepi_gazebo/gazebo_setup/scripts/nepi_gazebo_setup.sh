@@ -29,6 +29,14 @@ sudo -v
 SCRIPT_FOLDER=$(cd -P "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)
 RESOURCES_FOLDER=$(dirname ${SCRIPT_FOLDER})/resources
 
+# Pinned copy of the above, resolved here while the cwd is still the one the
+# script was invoked from. BASH_SOURCE[0] is relative when the script is run
+# as ./nepi_gazebo_setup.sh, so re-resolving it later -- after the cd's in
+# steps 2/5/6 -- yields whatever directory we happen to be in instead of this
+# one. Step 8 below needs the real path, so it uses this rather than
+# recomputing.
+NEPI_GAZEBO_SCRIPTS_DIR=${SCRIPT_FOLDER}
+
 NEPI_UTILS_SOURCE=${RESOURCES_FOLDER}/bash/nepi_gazebo_bash_utils
 source $NEPI_UTILS_SOURCE
 
@@ -122,18 +130,51 @@ else
     export PATH=${HOME}/.local/bin:$PATH
 
     Tools/environment_install/install-prereqs-ubuntu.sh -y
+    prereqs_rc=$?
 
     # Reload profile to register build path changes
     if [[ -f ${HOME}/.profile ]]; then
         . ${HOME}/.profile
     fi
 
+    # The prereqs script installs its apt packages and its pip packages in
+    # separate phases, and a failure in the pip phase does not stop the
+    # script or show up in its exit code -- which silently leaves the SITL
+    # build unable to run ("you need to install empy with ..." from waf,
+    # much later and far from the real cause). Verify the python modules the
+    # build and sim_vehicle.py actually need, and repair rather than guess.
+    if [[ $prereqs_rc -ne 0 ]]; then
+        echo "WARNING: install-prereqs-ubuntu.sh exited ${prereqs_rc}"
+    fi
+
+    missing_py_pkgs=""
+    # module:pip-name -- the import name differs from the package name for
+    # empy (em) and MAVProxy (MAVProxy is importable under its own name).
+    for pair in em:empy==3.3.4 pymavlink:pymavlink MAVProxy:MAVProxy \
+                serial:pyserial future:future lxml:lxml; do
+        if ! python3 -c "import ${pair%%:*}" >/dev/null 2>&1; then
+            missing_py_pkgs="${missing_py_pkgs} ${pair#*:}"
+        fi
+    done
+
+    if [[ -n "$missing_py_pkgs" ]]; then
+        echo "Python prerequisites missing after install-prereqs-ubuntu.sh:${missing_py_pkgs}"
+        echo "Installing them directly"
+        python3 -m pip install --user ${missing_py_pkgs}
+    fi
+
 
     ####################################
     # 3. Add autotest tools to PATH so sim_vehicle.py runs anywhere
 
+    # Append for future shells, AND export directly for this one -- sourcing
+    # .bashrc here does nothing, since Ubuntu's stock .bashrc returns
+    # immediately when $- has no 'i' (which is the case for this script).
+    # Step 4 below calls sim_vehicle.py from this same shell, so without the
+    # direct export it exits 127 and the EEPROM/parameter init silently
+    # never happens.
     echo 'export PATH=$PATH:$HOME/ardupilot/Tools/autotest' >> ${HOME}/.bashrc
-    source ${HOME}/.bashrc
+    export PATH=$PATH:${ARDUPILOT_FOLDER}/Tools/autotest
 
 
     ####################################
@@ -148,8 +189,26 @@ else
     echo "########"
 
     cd ${ARDUPILOT_FOLDER}/ArduCopter
-    timeout 60 sim_vehicle.py -w
-    echo "SITL parameter initialization complete"
+
+    # On a fresh checkout this call has to COMPILE ArduCopter SITL before it
+    # can write anything, which takes far longer than the 60s this step used
+    # to allow -- the timeout killed waf mid-build every time, leaving no
+    # binary and no EEPROM. Allow enough time for the build, and note that
+    # the exit code alone can't confirm success: timeout returns 124 both
+    # when it interrupts the expected post-init idle AND when it cuts the
+    # build short. Check for the artifacts instead.
+    timeout 900 sim_vehicle.py -w
+
+    if [[ -f ${ARDUPILOT_FOLDER}/build/sitl/bin/arducopter ]] \
+       && find ${ARDUPILOT_FOLDER}/ArduCopter -maxdepth 2 -name 'eeprom.bin' | grep -q .; then
+        echo "SITL parameter initialization complete"
+    else
+        echo "WARNING: SITL parameter initialization did not complete"
+        [[ -f ${ARDUPILOT_FOLDER}/build/sitl/bin/arducopter ]] \
+            || echo "WARNING:   the ArduCopter SITL binary was not built"
+        echo "WARNING: re-run 'sim_vehicle.py -w' from ${ARDUPILOT_FOLDER}/ArduCopter"
+        echo "WARNING:   (let it finish building, then Ctrl+C once it settles)"
+    fi
 
 
     ####################################
@@ -193,7 +252,13 @@ else
 
     # NEPI's default storage path crashes Boost when used as the temp dir
     echo 'export TMPDIR=/tmp' >> ${HOME}/.bashrc
-    source ${HOME}/.bashrc
+
+    # Same as step 3: the .bashrc appends above only reach future shells, so
+    # export directly too for the rest of this run.
+    source /usr/share/gazebo/setup.sh
+    export GAZEBO_MODEL_PATH=$GAZEBO_MODEL_PATH:${ARDUPILOT_GAZEBO_FOLDER}/models
+    export GAZEBO_RESOURCE_PATH=$GAZEBO_RESOURCE_PATH:${ARDUPILOT_GAZEBO_FOLDER}/worlds
+    export TMPDIR=/tmp
 
 
     ####################################
@@ -239,9 +304,13 @@ else
     # every start, so the device gets seeded the first time Gazebo starts,
     # not here.
 
-    SCRIPT_FOLDER=$(cd -P "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)
-    BASH_SETUP_FILE=${SCRIPT_FOLDER}/nepi_gazebo_bash_setup.sh
-    source $BASH_SETUP_FILE
+    BASH_SETUP_FILE=${NEPI_GAZEBO_SCRIPTS_DIR}/nepi_gazebo_bash_setup.sh
+    if [[ ! -f "$BASH_SETUP_FILE" ]]; then
+        echo "ERROR: bash setup script not found: ${BASH_SETUP_FILE}"
+        echo "ERROR: NEPI Gazebo bash environment was NOT configured"
+    else
+        source $BASH_SETUP_FILE
+    fi
 
 
     echo ""
