@@ -91,17 +91,27 @@
     </model>
 
     <!--
-      NEPI addition (not upstream khancyr/ardupilot_gazebo): a standalone
-      chase-cam model, repositioned every frame by
-      camera_rig_controller_ardupilot.py via /gazebo/set_model_state, see
-      sim_container/models/camera_rig/model.config. Single instance only
-      (ArduPilot SITL is single-vehicle), so no per-instance namespacing
-      concern here, a plain include is correct, unlike the multi-rover
-      world's inlined duplicates.
+      NEPI addition (not upstream khancyr/ardupilot_gazebo): camera_rig
+      (robot view) and camera_rig_chase (scene/chase view), both
+      repositioned every frame by camera_rig_controller_ardupilot.py via
+      /gazebo/set_model_state, see sim_container/models/camera_rig/
+      model.config. No longer included statically here (removed 2026-09-09,
+      while adding live FOV support): FOV is baked into each rig's own SDF
+      at spawn time, so a live FOV change needs to respawn them (delete
+      then spawn_sdf_model), and a name that originates from a world-file
+      include tag hits a real Gazebo caching quirk on that first respawn,
+      the exact same one sim_bridge_node.py's own ROVER_MODEL_NAME_CUSTOM
+      already works around for the rover (confirmed live 2026-09-09:
+      leaving these two include tags in place while also respawning under
+      the same names left both image topics silently dead after the first
+      FOV change, a textbook symptom of that quirk). Cleanest fix is for
+      Python to own spawning both from the start, so neither name is ever
+      include-derived in the first place, camera_rig_controller_
+      ardupilot.py's own __init__ now spawns both directly via
+      /gazebo/spawn_sdf_model (retrying if gzserver's spawn service isn't
+      up yet, same pattern as ai_targeting_controller_ardupilot.py's own
+      chair spawn), and every respawn after that reuses the same name
+      safely, same as the rover's own custom name does.
     -->
-    <include>
-      <uri>model://camera_rig</uri>
-      <pose>3 3 1 0 0 0</pose>
-    </include>
   </world>
 </sdf>

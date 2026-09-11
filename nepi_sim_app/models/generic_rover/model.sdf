@@ -320,7 +320,7 @@
         <always_on>true</always_on>
         <visualize>false</visualize>
         <camera name="rover_camera">
-          <horizontal_fov>0.6981317</horizontal_fov>
+          <horizontal_fov>1.7453293</horizontal_fov>
           <image>
             <width>640</width>
             <height>480</height>
@@ -399,7 +399,7 @@
         <always_on>true</always_on>
         <visualize>false</visualize>
         <camera name="rover_camera_chase">
-          <horizontal_fov>0.6981317</horizontal_fov>
+          <horizontal_fov>1.7453293</horizontal_fov>
           <image>
             <width>640</width>
             <height>480</height>
