@@ -1,0 +1,191 @@
+#!/bin/bash
+
+##
+## Copyright (c) 2024 Numurus <https://www.numurus.com>.
+##
+## This file is part of nepi setup tools (nepi_setup) repo
+## (see https://github.com/nepi-engine/nepi_setup)
+##
+## License: nepi setup tools are licensed under the "Numurus Software License",
+## which can be found at: <https://numurus.com/wp-content/uploads/Numurus-Software-License-Terms.pdf>
+##
+## Redistributions in source code must retain this top-level comment block.
+## Plagiarizing this software to sidestep the license obligations is illegal.
+##
+## Contact Information:
+## ====================
+## - mailto:nepi@numurus.com
+##
+
+
+if [[ ! -n $CONFIG_USER ]]; then
+    CONFIG_USER=$(id -un)
+    if [[ ${CONFIG_USER} == 'root' ]]; then
+        CONFIG_USER=$SUDO_USER
+    fi
+fi
+if [[ ! -n $CONFIG_USER ]]; then
+    CONFIG_USER=$(id -nu 1000)
+fi
+export CONFIG_USER=$CONFIG_USER
+
+export BASH_FOLDER=$(cd -P "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)
+
+if [[ ${NEPI_MODE} == 'SYSTEM' || ${NEPI_MODE} == 'HOST' || ${NEPI_MODE} == 'REMOTE' ]]; then
+  nepi_mode=$NEPI_MODE
+else
+  nepi_mode='SYSTEM'
+fi
+export NEPI_MODE=$nepi_mode
+
+export NEPI_USER=nepi
+export NEPI_IP=192.168.179.103
+
+
+function is_valid_internet(){
+    if ! ping -c 2 google.com; then
+        echo "No Internet Connection"
+        return 1
+    else
+        echo "Internet Connected"
+        return 0
+    fi
+}
+export -f is_valid_internet
+
+
+function ask_yes_no {
+    read -p "$1 ([y]es or [N]o): " choice
+    case "$(echo "$choice" | tr '[:upper:]' '[:lower:]')" in
+        y|yes) echo "yes" ;;
+        *) echo "no" ;;
+    esac
+}
+export -f ask_yes_no
+
+
+function pingn(){
+    ip="${NEPI_IP%%/*}"
+    if ! timeout 1 ping -c 1 -W 1 ${ip} > /dev/null 2>&1; then
+        echo "No NEPI Connection at ${ip}"
+        return 1
+    else
+        echo "NEPI Connected at ${ip}"
+    fi
+}
+export -f pingn
+
+
+function update_yaml_value(){
+    export UPDATE_YAML_KEY=$1
+    export UPDATE_YAML_VAL=$2
+    export UPDATE_YAML_FILE=$3
+
+    yq e -i '.'"$UPDATE_YAML_KEY"' = env(UPDATE_YAML_VAL)' $UPDATE_YAML_FILE
+
+    eval "export $UPDATE_YAML_KEY=\"$UPDATE_YAML_VAL\""
+}
+export -f update_yaml_value
+
+
+function sync_yaml_files(){
+    SOURCE_FILE=$1
+    TARGET_FILE=$2
+    REPLACE_ENTRIES=0
+
+    if [[ ! -f "$SOURCE_FILE" ]]; then
+        echo "Source file does not exist: ${SOURCE_FILE}"
+        return 1
+    fi
+
+    if [[ ! -f "$TARGET_FILE" ]]; then
+        echo "Target file does not exist: ${TARGET_FILE}"
+        return 1
+    fi
+
+    eval_cmd="success=$(python3 ${BASH_FOLDER}/nepi_utils/sync_yaml_files.py $SOURCE_FILE $TARGET_FILE $REPLACE_ENTRIES)"
+    eval "$eval_cmd"
+    success=$(echo ${success})
+
+    if [[ "$success" -ne 1 ]]; then
+        echo "Success = ${success}"
+        return 1
+    fi
+}
+export -f sync_yaml_files
+
+
+function nepistorage() {
+
+  shpassword=$1
+  shfolder=nepi_storage
+  if [[ ${NEPI_MODE} == 'REMOTE' ]]; then
+    sudo -v
+    if pingn; then
+
+      shdrive=/mnt/nepi_share_storage
+
+      #echo "Checking for mountpoint at: ${shdrive}"
+      sudo umount -l $shdrive >/dev/null
+      # timeout 1 mountpoint -q $shdrive
+      # if [[ $? -eq 0 ]]; then
+      #   echo "Unmounting mountpoint at: ${shdrive}"
+      #   timeout 1 sudo umount $shdrivelib
+      # fi
+
+      echo "Checking for mount folder at: ${shdrive}"
+      if [[ ! -d $shdrive ]]; then
+          echo "Creating mount folder: ${shdrive}"
+          sudo mkdir $shdrive
+      fi
+
+
+      echo "Setting mount folder permissions: ${shdrive}"
+      sudo chown ${CONFIG_USER}:${CONFIG_USER} $shdrive
+      echo "Mounting shared drive at: //${NEPI_IP}/${shfolder} to ${shdrive}"
+      if [[ -n $shpassword ]]; then
+        sudo mount.cifs //${NEPI_IP}/${shfolder} $shdrive -o user=$NEPI_USER,password=$shpassword,uid=$(id -u),gid=$(id -g)
+      else
+        sudo mount.cifs //${NEPI_IP}/${shfolder} $shdrive -o user=$NEPI_USER,uid=$(id -u),gid=$(id -g)
+      fi
+
+      if timeout 1 mountpoint -q $shdrive; then
+        cd $shdrive
+        echo $shdrive
+        return 0
+      else
+        echo "Failed to mount and connect nepi shared folder: ${shdrive}"
+        return 1
+      fi
+    else
+        return 1
+    fi
+  else
+    shdrive=/mnt/${shfolder}
+    if [[ -d $shdrive ]]; then
+      cd $shdrive
+      echo $shdrive
+      return 0
+    else
+      echo "Failed to mount and connect nepi shared folder: ${shdrive}"
+
+      return 1
+    fi
+  fi
+}
+
+export -f nepistorage
+
+
+function nepi_gazebo_start(){
+    gazebo_resources_folder=${NEPI_GAZEBO_RESOURCES_FOLDER:-$(dirname "${BASH_FOLDER}")}
+    gazebo_start_script=${gazebo_resources_folder}/config/nepi_gazebo_start.sh
+
+    if [[ ! -f "$gazebo_start_script" ]]; then
+        echo "nepi_gazebo_start.sh not found at: ${gazebo_start_script}"
+        return 1
+    fi
+
+    bash "$gazebo_start_script" "$@"
+}
+export -f nepi_gazebo_start
